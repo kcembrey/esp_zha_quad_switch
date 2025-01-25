@@ -23,7 +23,7 @@
 #define SW03_GPIO_OUT                   GPIO_NUM_4
 #define SW04_GPIO_OUT                   GPIO_NUM_5
 
-#define DEBOUNCE_TIME_MS                50 
+#define DEBOUNCE_TIME_MS                100 
 
 #define ESP_ZB_PRIMARY_CHANNEL_MASK     ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK    /* Zigbee primary channel mask use in the example */
 
