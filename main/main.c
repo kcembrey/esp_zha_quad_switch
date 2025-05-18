@@ -9,6 +9,8 @@
 #include "iot_servo.h"
 #include "freertos/queue.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/timers.h"
+#include "nvs_flash.h"
 
 static const char *TAG = "ESP_ZB_QUAD_SWITCH";
 
@@ -18,8 +20,19 @@ bool button03_pressed = false;
 bool button04_pressed = false;
 
 static QueueHandle_t gpio_evt_queue = NULL;
+static TimerHandle_t servo_stop_timer = NULL;
 
 static void button_event_task(void* arg);
+
+// Timer callback function to stop the servo
+static void servo_stop_timer_callback(TimerHandle_t xTimer)
+{
+    ESP_LOGI(TAG, "Stopping servo (setting to 90 degrees)");
+    esp_err_t ret = iot_servo_write_angle(LEDC_LOW_SPEED_MODE, 0, 90.0f);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set servo angle to 90: %d", ret);
+    }
+}
 
 void IRAM_ATTR button_isr_handler(void *arg)
 {
@@ -71,6 +84,10 @@ void esp_app_switch_handler(uint8_t sw_ep)
     esp_err_t ret = iot_servo_write_angle(LEDC_LOW_SPEED_MODE, 0, angle);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "Servo angle set to %.1f degrees", angle);
+        // Start or reset the servo stop timer
+        if (servo_stop_timer != NULL && xTimerReset(servo_stop_timer, portMAX_DELAY) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to start/reset servo stop timer");
+        }
     }else {
         ESP_LOGE(TAG, "Failed to set servo angle: %d", ret);
     }
@@ -241,7 +258,7 @@ static esp_zb_cluster_list_t *add_basic_and_identify_clusters_create(
     return cluster_list;
 }
 
-static void esp_zb_task(void *pvParameters)
+void esp_zb_task(void *pvParameters)
 {
     /* Initialize Zigbee stack */
     esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
@@ -290,7 +307,8 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
 
-    esp_zb_main_loop_iteration();
+    /* Join Zigbee network */
+    esp_zb_stack_main_loop();
 }
 
 uint8_t get_in_pin(uint8_t sw_ep)
@@ -312,6 +330,14 @@ uint8_t get_in_pin(uint8_t sw_ep)
 
 void app_main(void)
 {
+    // Initialize NVS flash
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
     esp_zb_platform_config_t config = {
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
         .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
@@ -341,6 +367,19 @@ void app_main(void)
 
     /* Start Zigbee stack task */
     xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
+
+    // Create the servo stop timer (2000ms = 2 seconds)
+    servo_stop_timer = xTimerCreate(
+        "ServoStopTimer",
+        pdMS_TO_TICKS(2000), // Timer period in ticks
+        pdFALSE,             // One-shot timer
+        0,                   // Timer ID (not used here)
+        servo_stop_timer_callback // Callback function
+    );
+
+    if (servo_stop_timer == NULL) {
+        ESP_LOGE(TAG, "Failed to create servo stop timer");
+    }
 }
 
 static void button_event_task(void* arg)
