@@ -5,6 +5,10 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "ha/esp_zigbee_ha_standard.h"
+#include "driver/ledc.h"
+#include "iot_servo.h"
+#include "freertos/queue.h"
+#include "freertos/FreeRTOS.h"
 
 static const char *TAG = "ESP_ZB_QUAD_SWITCH";
 
@@ -12,6 +16,10 @@ bool button01_pressed = false;
 bool button02_pressed = false;
 bool button03_pressed = false;
 bool button04_pressed = false;
+
+static QueueHandle_t gpio_evt_queue = NULL;
+
+static void button_event_task(void* arg);
 
 void IRAM_ATTR button_isr_handler(void *arg)
 {
@@ -22,19 +30,23 @@ void IRAM_ATTR button_isr_handler(void *arg)
     {
         if ((int)arg == SW01_GPIO_IN)
         {
-            button01_pressed = true;
+            uint32_t gpio_num = (uint32_t)arg;
+            xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
         }
         else if ((int)arg == SW02_GPIO_IN)
         {
-            button02_pressed = true;
+            uint32_t gpio_num = (uint32_t)arg;
+            xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
         }
         else if ((int)arg == SW03_GPIO_IN)
         {
-            button03_pressed = true;
+            uint32_t gpio_num = (uint32_t)arg;
+            xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
         }
         else if ((int)arg == SW04_GPIO_IN)
         {
-            button04_pressed = true;
+            uint32_t gpio_num = (uint32_t)arg;
+            xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
         }
         last_isr_time = current_time;
     }
@@ -42,6 +54,7 @@ void IRAM_ATTR button_isr_handler(void *arg)
 
 void esp_app_switch_handler(uint8_t sw_ep)
 {
+    ESP_LOGI(TAG, "handler called for switch %d", sw_ep);
 
     esp_zb_zcl_attr_t *switch_attr = esp_zb_zcl_get_attribute(
         sw_ep,
@@ -51,9 +64,16 @@ void esp_app_switch_handler(uint8_t sw_ep)
     bool cur_val = *(bool *)switch_attr->data_p;
     cur_val = !cur_val;
 
-    uint8_t out_pin = get_out_pin(sw_ep);
-    gpio_set_level(out_pin, cur_val);
-
+    // Toggle servo between 0 and 180 degrees
+    static bool servo_state = false;
+    servo_state = !servo_state;
+    float angle = servo_state ? 180.0f : 0.0f;
+    esp_err_t ret = iot_servo_write_angle(LEDC_LOW_SPEED_MODE, 0, angle);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Servo angle set to %.1f degrees", angle);
+    }else {
+        ESP_LOGE(TAG, "Failed to set servo angle: %d", ret);
+    }
 
     esp_zb_lock_acquire(portMAX_DELAY);
     esp_zb_zcl_set_attribute_val(sw_ep,
@@ -68,7 +88,7 @@ void report_switch_attr(uint8_t ep)
     esp_zb_zcl_report_attr_cmd_t report_attr_cmd;
     report_attr_cmd.address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT;
     report_attr_cmd.attributeID = ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID;
-    report_attr_cmd.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE;
+    // report_attr_cmd.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE;
     report_attr_cmd.clusterID = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF;
     report_attr_cmd.zcl_basic_cmd.src_endpoint = ep;
 
@@ -76,7 +96,6 @@ void report_switch_attr(uint8_t ep)
     esp_zb_zcl_report_attr_cmd_req(&report_attr_cmd);
     esp_zb_lock_release();
 }
-
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
@@ -87,6 +106,22 @@ static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 static esp_err_t deferred_driver_init(void)
 {
     ESP_LOGI(TAG, "Started");
+    servo_config_t servo_cfg = {
+        .max_angle = 180,
+        .min_width_us = 500,
+        .max_width_us = 2500,
+        .freq = 50,
+        .timer_number = LEDC_TIMER_0,
+        .channels = {
+            .servo_pin = {SERVO_GPIO_OUT},
+            .ch = {LEDC_CHANNEL_0},
+        },
+        .channel_number = 1,
+    };
+    esp_err_t ret = iot_servo_init(LEDC_LOW_SPEED_MODE, &servo_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Servo initialization failed: %d", ret);
+    }
     return ESP_OK;
 }
 
@@ -114,8 +149,7 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
             {
                 switch_state = message->attribute.data.value ? *(bool *)message->attribute.data.value : switch_state;
                 ESP_LOGI(TAG, "Switch %d, set to %s", sw_ep, switch_state ? "On" : "Off");
-                uint8_t out_pin = get_out_pin(sw_ep);
-                gpio_set_level(out_pin, switch_state);
+                esp_app_switch_handler(sw_ep);
             }
         }
     }
@@ -152,7 +186,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
         if (err_status == ESP_OK)
         {
-
             ESP_LOGI(TAG, "Device started up in %s factory-reset mode", esp_zb_bdb_is_factory_new() ? "" : "non");
             if (esp_zb_bdb_is_factory_new())
             {
@@ -277,24 +310,6 @@ uint8_t get_in_pin(uint8_t sw_ep)
     return SW04_GPIO_IN;
 }
 
-uint8_t get_out_pin(uint8_t sw_ep)
-{
-    if (sw_ep == HA_ESP_SW01_EP)
-    {
-        return SW01_GPIO_OUT;
-    }
-    if (sw_ep == HA_ESP_SW02_EP)
-    {
-        return SW02_GPIO_OUT;
-    }
-    if (sw_ep == HA_ESP_SW03_EP)
-    {
-        return SW03_GPIO_OUT;
-    }
-    return SW04_GPIO_OUT;
-}
-
-
 void app_main(void)
 {
     esp_zb_platform_config_t config = {
@@ -304,17 +319,6 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
 
     // Configure GPIOs
-    gpio_config_t io_conf_out = {};
-    io_conf_out.mode = GPIO_MODE_OUTPUT;
-    io_conf_out.pin_bit_mask = (1ULL << SW01_GPIO_OUT) | (1ULL << SW02_GPIO_OUT) | (1ULL << SW03_GPIO_OUT) | (1ULL << SW04_GPIO_OUT);
-    gpio_config(&io_conf_out);
-
-    // Ensure all off
-    gpio_set_level(SW01_GPIO_OUT, 0);
-    gpio_set_level(SW02_GPIO_OUT, 0);
-    gpio_set_level(SW03_GPIO_OUT, 0);
-    gpio_set_level(SW04_GPIO_OUT, 0);
-
     gpio_config_t io_conf_in = {};
     io_conf_in.intr_type = GPIO_INTR_POSEDGE;
     io_conf_in.mode = GPIO_MODE_INPUT;
@@ -329,30 +333,35 @@ void app_main(void)
     gpio_isr_handler_add(SW03_GPIO_IN, button_isr_handler, (void *)SW03_GPIO_IN);
     gpio_isr_handler_add(SW04_GPIO_IN, button_isr_handler, (void *)SW04_GPIO_IN);
 
+    // Create a queue to handle gpio event from isr
+    gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
+
+    // Create a task to handle the button press events
+    xTaskCreate(button_event_task, "gpio_task", 2048, NULL, 10, NULL);
+
     /* Start Zigbee stack task */
     xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
+}
 
-    while (true) {
-        if (button01_pressed) {
-            ESP_LOGI(TAG, "Button 1 Pressed");
-            button01_pressed = false;
-            esp_app_switch_handler(HA_ESP_SW01_EP);
+static void button_event_task(void* arg)
+{
+    uint32_t io_num;
+    for(;;)
+    {
+        if(xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
+            if (io_num == SW01_GPIO_IN) {
+                ESP_LOGI(TAG, "Button 1 Pressed (from queue)");
+                esp_app_switch_handler(HA_ESP_SW01_EP);
+            } else if (io_num == SW02_GPIO_IN) {
+                ESP_LOGI(TAG, "Button 2 Pressed (from queue)");
+                esp_app_switch_handler(HA_ESP_SW02_EP);
+            } else if (io_num == SW03_GPIO_IN) {
+                ESP_LOGI(TAG, "Button 3 Pressed (from queue)");
+                esp_app_switch_handler(HA_ESP_SW03_EP);
+            } else if (io_num == SW04_GPIO_IN) {
+                ESP_LOGI(TAG, "Button 4 Pressed (from queue)");
+                esp_app_switch_handler(HA_ESP_SW04_EP);
+            }
         }
-        if (button02_pressed) {
-            ESP_LOGI(TAG, "Button 2 Pressed");
-            button02_pressed = false;
-            esp_app_switch_handler(HA_ESP_SW02_EP);
-        }
-        if (button03_pressed) {
-            ESP_LOGI(TAG, "Button 3 Pressed");
-            button03_pressed = false;
-            esp_app_switch_handler(HA_ESP_SW03_EP);
-        }
-        if (button04_pressed) {
-            ESP_LOGI(TAG, "Button 4 Pressed");
-            button04_pressed = false;
-            esp_app_switch_handler(HA_ESP_SW04_EP);
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }

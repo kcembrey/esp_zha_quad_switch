@@ -18,17 +18,13 @@
 #define SW03_GPIO_IN                    GPIO_NUM_2
 #define SW04_GPIO_IN                    GPIO_NUM_3
 
-#define SW01_GPIO_OUT                   GPIO_NUM_13
-#define SW02_GPIO_OUT                   GPIO_NUM_14
-#define SW03_GPIO_OUT                   GPIO_NUM_4
-#define SW04_GPIO_OUT                   GPIO_NUM_5
+#define SERVO_GPIO_OUT                  GPIO_NUM_20
 
 #define DEBOUNCE_TIME_MS                100 
 
 #define ESP_ZB_PRIMARY_CHANNEL_MASK     ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK    /* Zigbee primary channel mask use in the example */
 
 uint8_t get_in_pin(uint8_t sw_ep);
-uint8_t get_out_pin(uint8_t sw_ep);
 uint8_t get_pin_state_index(uint8_t sw_ep);
 void report_switch_attr(uint8_t ep);
 void esp_app_switch_handler(uint8_t sw_ep);
@@ -41,8 +37,8 @@ void esp_app_switch_handler(uint8_t sw_ep);
 /* Attribute values in ZCL string format
  * The string should be started with the length of its own.
  */
-#define MANUFACTURER_NAME               "\x0A""iSilentLLC"
-#define MODEL_IDENTIFIER                "\x0B""Quad Switch"
+#define MANUFACTURER_NAME               "\x0A""Hoobajoob"
+#define MODEL_IDENTIFIER                "\x0B""Test Door"
 
 
 #define ESP_ZB_ZED_CONFIG()                                         \
