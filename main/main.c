@@ -11,6 +11,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include "nvs_flash.h"
+#include "esp_heap_caps.h"
+#include "esp_pm.h"
+#include "esp_timer.h"
+#include "driver/gpio.h"
+#include "esp_newlib.h"
 
 static const char *TAG = "ESP_ZB_QUAD_SWITCH";
 
@@ -337,6 +342,19 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // Configure power management for light sleep
+    esp_pm_config_t pm_config = {
+        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ, // Use default max frequency from sdkconfig
+        .min_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ, // Use default min frequency (XTAL) from sdkconfig
+        .light_sleep_enable = true
+    };
+    esp_err_t pm_ret = esp_pm_configure(&pm_config);
+    if (pm_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Power management configuration failed: %s", esp_err_to_name(pm_ret));
+    } else {
+        ESP_LOGI(TAG, "Power management configured for light sleep");
+    }
 
     esp_zb_platform_config_t config = {
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
