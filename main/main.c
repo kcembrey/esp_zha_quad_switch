@@ -16,6 +16,9 @@
 #include "esp_timer.h"
 #include "driver/gpio.h"
 #include "esp_newlib.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 
 static const char *TAG = "ESP_ZB_QUAD_SWITCH";
 
@@ -27,14 +30,15 @@ bool button04_pressed = false;
 static QueueHandle_t gpio_evt_queue = NULL;
 static TimerHandle_t servo_stop_timer = NULL;
 
-static void button_event_task(void* arg);
+static void button_event_task(void *arg);
 
 // Timer callback function to stop the servo
 static void servo_stop_timer_callback(TimerHandle_t xTimer)
 {
     ESP_LOGI(TAG, "Stopping servo (setting to 90 degrees)");
     esp_err_t ret = iot_servo_write_angle(LEDC_LOW_SPEED_MODE, 0, 90.0f);
-    if (ret != ESP_OK) {
+    if (ret != ESP_OK)
+    {
         ESP_LOGE(TAG, "Failed to set servo angle to 90: %d", ret);
     }
 }
@@ -47,21 +51,6 @@ void IRAM_ATTR button_isr_handler(void *arg)
     if (current_time - last_isr_time > DEBOUNCE_TIME_MS)
     {
         if ((int)arg == SW01_GPIO_IN)
-        {
-            uint32_t gpio_num = (uint32_t)arg;
-            xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
-        }
-        else if ((int)arg == SW02_GPIO_IN)
-        {
-            uint32_t gpio_num = (uint32_t)arg;
-            xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
-        }
-        else if ((int)arg == SW03_GPIO_IN)
-        {
-            uint32_t gpio_num = (uint32_t)arg;
-            xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
-        }
-        else if ((int)arg == SW04_GPIO_IN)
         {
             uint32_t gpio_num = (uint32_t)arg;
             xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
@@ -87,13 +76,17 @@ void esp_app_switch_handler(uint8_t sw_ep)
     servo_state = !servo_state;
     float angle = servo_state ? 180.0f : 0.0f;
     esp_err_t ret = iot_servo_write_angle(LEDC_LOW_SPEED_MODE, 0, angle);
-    if (ret == ESP_OK) {
+    if (ret == ESP_OK)
+    {
         ESP_LOGI(TAG, "Servo angle set to %.1f degrees", angle);
         // Start or reset the servo stop timer
-        if (servo_stop_timer != NULL && xTimerReset(servo_stop_timer, portMAX_DELAY) != pdPASS) {
+        if (servo_stop_timer != NULL && xTimerReset(servo_stop_timer, portMAX_DELAY) != pdPASS)
+        {
             ESP_LOGE(TAG, "Failed to start/reset servo stop timer");
         }
-    }else {
+    }
+    else
+    {
         ESP_LOGE(TAG, "Failed to set servo angle: %d", ret);
     }
 
@@ -141,7 +134,8 @@ static esp_err_t deferred_driver_init(void)
         .channel_number = 1,
     };
     esp_err_t ret = iot_servo_init(LEDC_LOW_SPEED_MODE, &servo_cfg);
-    if (ret != ESP_OK) {
+    if (ret != ESP_OK)
+    {
         ESP_LOGE(TAG, "Servo initialization failed: %d", ret);
     }
     return ESP_OK;
@@ -158,11 +152,7 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
     ESP_LOGI(TAG, "Received message: endpoint(%d), cluster(0x%x), attribute(0x%x), data size(%d)", message->info.dst_endpoint, message->info.cluster,
              message->attribute.id, message->attribute.data.size);
 
-    if (
-        (message->info.dst_endpoint == HA_ESP_SW01_EP) ||
-        (message->info.dst_endpoint == HA_ESP_SW02_EP) ||
-        (message->info.dst_endpoint == HA_ESP_SW03_EP) ||
-        (message->info.dst_endpoint == HA_ESP_SW04_EP))
+    if (message->info.dst_endpoint == HA_ESP_SW01_EP)
     {
         uint8_t sw_ep = message->info.dst_endpoint;
         if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF)
@@ -191,6 +181,77 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
         break;
     }
     return ret;
+}
+
+// Battery monitoring variables
+static adc_oneshot_unit_handle_t adc1_handle;
+static const adc_channel_t battery_channel = ADC_CHANNEL_0; // ADC1_CHANNEL_0 corresponds to GPIO 18
+static const adc_atten_t battery_atten = ADC_ATTEN_DB_12;
+static const uint32_t BATTERY_CHECK_INTERVAL_MS = 600000; // Check battery every 10 minutes
+static bool zigbee_ready = false;
+
+// Function to read battery voltage
+static float read_battery_voltage(void)
+{
+    int adc_reading = 0;
+    // Take multiple samples and average them
+    for (int i = 0; i < 10; i++)
+    {
+        int raw_value;
+        adc_oneshot_read(adc1_handle, battery_channel, &raw_value);
+        adc_reading += raw_value;
+    }
+    adc_reading /= 10;
+
+    // Convert ADC reading to voltage (simple linear conversion)
+    // For 12-bit ADC with 11dB attenuation, 3.3V = 4095
+    return (float)adc_reading * 3.3f / 4095.0f;
+}
+
+// Battery monitoring task
+static void battery_monitor_task(void *pvParameters)
+{
+    // Initialize ADC
+    adc_oneshot_unit_init_cfg_t init_config = {
+        .unit_id = ADC_UNIT_1,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc1_handle));
+
+    // Configure ADC channel
+    adc_oneshot_chan_cfg_t config = {
+        .bitwidth = ADC_BITWIDTH_12,
+        .atten = battery_atten,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, battery_channel, &config));
+
+    while (1)
+    {
+        float battery_voltage = read_battery_voltage();
+        ESP_LOGI(TAG, "Battery voltage: %.2fV", battery_voltage);
+
+        // Calculate battery percentage (assuming 3.3V is 100% and 2.8V is 0%)
+        uint8_t battery_percentage = (uint8_t)((battery_voltage - 2.8f) * 100.0f / (3.3f - 2.8f));
+        if (battery_percentage > 100)
+            battery_percentage = 100;
+        if (battery_percentage <= 0)
+            battery_percentage = 0;
+
+        // Only report battery level if Zigbee is ready
+        if (zigbee_ready)
+        {
+            esp_zb_lock_acquire(portMAX_DELAY);
+            esp_zb_zcl_set_attribute_val(HA_ESP_BATTERY_EP,
+                                         ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+                                         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                                         0x0021, // Battery Percentage Remaining attribute ID
+                                         &battery_percentage,
+                                         false);
+            esp_zb_lock_release();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(BATTERY_CHECK_INTERVAL_MS));
+    }
 }
 
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
@@ -235,6 +296,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                      extended_pan_id[7], extended_pan_id[6], extended_pan_id[5], extended_pan_id[4],
                      extended_pan_id[3], extended_pan_id[2], extended_pan_id[1], extended_pan_id[0],
                      esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
+            zigbee_ready = true; // Set flag when Zigbee is ready
         }
         else
         {
@@ -280,7 +342,7 @@ void esp_zb_task(void *pvParameters)
         .identify_time = ESP_ZB_ZCL_IDENTIFY_IDENTIFY_TIME_DEFAULT_VALUE};
 
     // On Off End points
-    for (uint8_t sw_ep = HA_ESP_SW01_EP; sw_ep < HA_ESP_SW04_EP + 1; sw_ep++)
+    for (uint8_t sw_ep = HA_ESP_SW01_EP; sw_ep < HA_ESP_SW01_EP + 1; sw_ep++)
     {
         uint16_t sw_cur_val = 0x00;
         esp_zb_on_off_cluster_cfg_t sw_in_cfg = {
@@ -289,12 +351,12 @@ void esp_zb_task(void *pvParameters)
 
         esp_zb_cluster_list_t *sw_cluster_list = esp_zb_zcl_cluster_list_create();
 
-        if (sw_ep == HA_ESP_SW01_EP) {
+        if (sw_ep == HA_ESP_SW01_EP)
+        {
             sw_cluster_list = add_basic_and_identify_clusters_create(
-            &identify_cluster_cfg,
-            &basic_cluster_cfg);
+                &identify_cluster_cfg,
+                &basic_cluster_cfg);
         }
-       
 
         ESP_ERROR_CHECK(esp_zb_cluster_list_add_on_off_cluster(sw_cluster_list, sw_in_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
@@ -318,26 +380,15 @@ void esp_zb_task(void *pvParameters)
 
 uint8_t get_in_pin(uint8_t sw_ep)
 {
-    if (sw_ep == HA_ESP_SW01_EP)
-    {
-        return SW01_GPIO_IN;
-    }
-    if (sw_ep == HA_ESP_SW02_EP)
-    {
-        return SW02_GPIO_IN;
-    }
-    if (sw_ep == HA_ESP_SW03_EP)
-    {
-        return SW03_GPIO_IN;
-    }
-    return SW04_GPIO_IN;
+    return SW01_GPIO_IN;
 }
 
 void app_main(void)
 {
     // Initialize NVS flash
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
@@ -347,12 +398,14 @@ void app_main(void)
     esp_pm_config_t pm_config = {
         .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ, // Use default max frequency from sdkconfig
         .min_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ, // Use default min frequency (XTAL) from sdkconfig
-        .light_sleep_enable = true
-    };
+        .light_sleep_enable = true};
     esp_err_t pm_ret = esp_pm_configure(&pm_config);
-    if (pm_ret != ESP_OK) {
+    if (pm_ret != ESP_OK)
+    {
         ESP_LOGE(TAG, "Power management configuration failed: %s", esp_err_to_name(pm_ret));
-    } else {
+    }
+    else
+    {
         ESP_LOGI(TAG, "Power management configured for light sleep");
     }
 
@@ -366,16 +419,13 @@ void app_main(void)
     gpio_config_t io_conf_in = {};
     io_conf_in.intr_type = GPIO_INTR_POSEDGE;
     io_conf_in.mode = GPIO_MODE_INPUT;
-    io_conf_in.pin_bit_mask = (1ULL << SW01_GPIO_IN) | (1ULL << SW02_GPIO_IN) | (1ULL << SW03_GPIO_IN) | (1ULL << SW04_GPIO_IN);
+    io_conf_in.pin_bit_mask = (1ULL << SW01_GPIO_IN);
     io_conf_in.pull_up_en = GPIO_PULLUP_ENABLE;
     gpio_config(&io_conf_in);
 
     // Install ISR service and attach handlers
     gpio_install_isr_service(0);
     gpio_isr_handler_add(SW01_GPIO_IN, button_isr_handler, (void *)SW01_GPIO_IN);
-    gpio_isr_handler_add(SW02_GPIO_IN, button_isr_handler, (void *)SW02_GPIO_IN);
-    gpio_isr_handler_add(SW03_GPIO_IN, button_isr_handler, (void *)SW03_GPIO_IN);
-    gpio_isr_handler_add(SW04_GPIO_IN, button_isr_handler, (void *)SW04_GPIO_IN);
 
     // Create a queue to handle gpio event from isr
     gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
@@ -389,35 +439,32 @@ void app_main(void)
     // Create the servo stop timer (2000ms = 2 seconds)
     servo_stop_timer = xTimerCreate(
         "ServoStopTimer",
-        pdMS_TO_TICKS(2000), // Timer period in ticks
-        pdFALSE,             // One-shot timer
-        0,                   // Timer ID (not used here)
+        pdMS_TO_TICKS(2000),      // Timer period in ticks
+        pdFALSE,                  // One-shot timer
+        0,                        // Timer ID (not used here)
         servo_stop_timer_callback // Callback function
     );
 
-    if (servo_stop_timer == NULL) {
+    if (servo_stop_timer == NULL)
+    {
         ESP_LOGE(TAG, "Failed to create servo stop timer");
     }
+
+    // Create battery monitoring task
+    xTaskCreate(battery_monitor_task, "battery_monitor", 2048, NULL, 5, NULL);
 }
 
-static void button_event_task(void* arg)
+static void button_event_task(void *arg)
 {
     uint32_t io_num;
-    for(;;)
+    for (;;)
     {
-        if(xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
-            if (io_num == SW01_GPIO_IN) {
+        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY))
+        {
+            if (io_num == SW01_GPIO_IN)
+            {
                 ESP_LOGI(TAG, "Button 1 Pressed (from queue)");
                 esp_app_switch_handler(HA_ESP_SW01_EP);
-            } else if (io_num == SW02_GPIO_IN) {
-                ESP_LOGI(TAG, "Button 2 Pressed (from queue)");
-                esp_app_switch_handler(HA_ESP_SW02_EP);
-            } else if (io_num == SW03_GPIO_IN) {
-                ESP_LOGI(TAG, "Button 3 Pressed (from queue)");
-                esp_app_switch_handler(HA_ESP_SW03_EP);
-            } else if (io_num == SW04_GPIO_IN) {
-                ESP_LOGI(TAG, "Button 4 Pressed (from queue)");
-                esp_app_switch_handler(HA_ESP_SW04_EP);
             }
         }
     }
